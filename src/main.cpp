@@ -76,6 +76,7 @@
 #include <lvgl.h>
 #include "gfxDriver.h"   // provides: extern LGFX_ST7796 display;
 #include "ui/ui.h"        // your UI (bars + keyboard)
+#include "ui/bindings.h"
 
 // Add once at the top of the file:
 #include "driver/periph_ctrl.h"  // periph_module_disable/enable on ESP32
@@ -548,12 +549,12 @@ void lvgl_start_task() {
     [](void*) {
 
       TickType_t last = xTaskGetTickCount();
-      const TickType_t period = pdMS_TO_TICKS(16); // 60Hz
+      const TickType_t period = pdMS_TO_TICKS(5); // 60Hz
 
       for (;;) {
         const int net_pct = (net_filled_slots() * 100) / NUM_BUFFERS;
         const int pcm_pct  = pcm_buffer_percent();
-        //ui_update_stats_bars(g_ui, net_pct , pcm_pct);
+        ui_update_stats_bars(net_pct , pcm_pct);
 
         //ui_update_stats_wifi(g_ui, WiFi.status(), WiFi.localIP().toString().c_str());
         //ui_update_stats_decoder(g_ui, codec_name_from_enum(feed_codec), currentMP3Info.samplerate, currentMP3Info.channels, currentMP3Info.kbps);
@@ -562,7 +563,7 @@ void lvgl_start_task() {
         //ui_update_player_id3(g_ui, true, id3m.artist, id3m.title, id3m.album, (int)id3m.track);
 
         lv_timer_handler();
-        ui_tick();
+        //ui_tick();
 
         vTaskDelayUntil(&last, period);  
       }
