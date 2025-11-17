@@ -776,7 +776,6 @@ static SlotCodec guess_slot_codec(const String& ctype, const char* url) {
 }
 
 static void httpFillTask(void* arg) {
-  
   ensure_wifi();
 
   HTTPClient http;
@@ -789,13 +788,16 @@ static void httpFillTask(void* arg) {
     h.setConnectTimeout(4000);
   };
 
+  // ---- Retry control (per track) ----
+  constexpr int MAX_TRACK_RETRIES = 3;
+  int stall_retries = 0;
+
   // Session-scoped stamping state
   SlotCodec session_tag = SLOT_UNKNOWN;
   bool      session_locked = false;
 
   // ID3v2 (per-session)
   ID3v2Collector id3c{};
-  
   id3v2_reset_collector(&id3c);
   id3v2_reset_meta(&id3m);
 
@@ -808,14 +810,22 @@ static void httpFillTask(void* arg) {
     const char* url = current_url();
     if (!url || !*url) return false;
 
-    http.end(); sock.stop();
+    http.end();
+    sock.stop();
+
     if (!http.begin(sock, url)) return false;
     prep_http(http, sock);
 
     int code = http.GET();
-    if (g_play_session != want_session) { http.end(); sock.stop(); return false; }
+    if (g_play_session != want_session) {
+      http.end();
+      sock.stop();
+      return false;
+    }
     if (!(code == HTTP_CODE_OK || code == HTTP_CODE_PARTIAL_CONTENT)) {
-      http.end(); sock.stop(); return false;
+      http.end();
+      sock.stop();
+      return false;
     }
 
     content_len = (int64_t)http.getSize(); // -1 if chunked
@@ -824,13 +834,15 @@ static void httpFillTask(void* arg) {
     g_new_track_pending = true;
 
     // Reset stamping + ID3 state for new session
-    session_tag     = SLOT_UNKNOWN;
-    session_locked  = false;
-    tail_valid      = false;
+    session_tag    = SLOT_UNKNOWN;
+    session_locked = false;
+    tail_valid     = false;
 
     id3v2_reset_collector(&id3c);
     id3v2_reset_meta(&id3m);
 
+    Serial.printf("[HTTP] Connected: %s (sess=%u, len=%lld)\n",
+                  url, (unsigned)want_session, (long long)content_len);
     return true;
   };
 
@@ -840,15 +852,20 @@ static void httpFillTask(void* arg) {
 
   int64_t content_len = -1;
   int64_t bytes_seen  = 0;
-  while (!connect_current(content_len)) vTaskDelay(pdMS_TO_TICKS(250));
-  bytes_seen = 0;
+
+  while (!connect_current(content_len)) {
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
+  bytes_seen      = 0;
+  stall_retries   = 0;
 
   for (;;) {
     // Forced/implicit session change
     if (g_play_session != my_session || g_force_next) {
       g_force_next    = false;
       stream_running  = false;
-      http.end(); sock.stop();
+      http.end();
+      sock.stop();
 
       net_ring_clear();
 
@@ -862,23 +879,34 @@ static void httpFillTask(void* arg) {
       my_session          = g_play_session;
       g_new_track_pending = true;
 
-      content_len = -1;
-      bytes_seen  = 0;
-      while (!connect_current(content_len)) vTaskDelay(pdMS_TO_TICKS(200));
+      content_len    = -1;
+      bytes_seen     = 0;
+      stall_retries  = 0;   // new session/track → reset retries
+
+      while (!connect_current(content_len)) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+      }
       continue;
     }
 
     // Need a free NET slot
-    if (netBufFilled[netWrite]) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+    if (netBufFilled[netWrite]) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
 
-    uint8_t* dst = netBuffers[netWrite];
-    size_t   need = MAX_CHUNK_SIZE;
-    size_t   wrote = 0;
-    uint32_t soft_deadline = millis() + 1200;
+    uint8_t* dst          = netBuffers[netWrite];
+    size_t   need         = MAX_CHUNK_SIZE;
+    size_t   wrote        = 0;
+    uint32_t soft_deadline = millis() + 1200;  // ~1.2s stall window
 
     while (need > 0) {
-      if (g_play_session != my_session) { wrote = 0; break; }
+      if (g_play_session != my_session) {
+        wrote = 0;
+        break;
+      }
 
+      // Enforce Content-Length if known
       if (content_len >= 0) {
         int64_t remain = content_len - bytes_seen;
         if (remain <= 0) break; // EOF
@@ -887,11 +915,15 @@ static void httpFillTask(void* arg) {
 
       int avail = sock.available();
       if (avail <= 0) {
+        // No data ready
         if (content_len >= 0 && bytes_seen >= content_len) break; // EOF
+
+        // Stalled?
         if (!sock.connected() || millis() > soft_deadline) {
-          // Drop/advance
+          // ---- Stall detected: drop this connection ----
           stream_running = false;
-          http.end(); sock.stop();
+          http.end();
+          sock.stop();
           net_ring_clear();
 
           session_tag    = SLOT_UNKNOWN;
@@ -901,6 +933,34 @@ static void httpFillTask(void* arg) {
           id3v2_reset_collector(&id3c);
           id3v2_reset_meta(&id3m);
 
+          if (stall_retries < MAX_TRACK_RETRIES) {
+            stall_retries++;
+            Serial.printf(
+              "[HTTP] Stall mid-track → retry %d/%d (sess=%u, bytes_seen=%lld)\n",
+              stall_retries, MAX_TRACK_RETRIES,
+              (unsigned)my_session, (long long)bytes_seen
+            );
+
+            content_len = -1;
+            bytes_seen  = 0;
+
+            while (!connect_current(content_len)) {
+              vTaskDelay(pdMS_TO_TICKS(200));
+            }
+
+            wrote = 0;
+            // We stay on the SAME track/session, just restarted it.
+            break;
+          }
+
+          // ---- Too many stalls → advance to next track ----
+          Serial.printf(
+            "[HTTP] Stall mid-track → giving up after %d retries → next track\n",
+            MAX_TRACK_RETRIES
+          );
+
+          stall_retries = 0;
+
           current_track_index = (current_track_index + 1) % playlist_count;
           g_play_session      = (uint32_t)current_track_index;
           my_session          = g_play_session;
@@ -908,10 +968,15 @@ static void httpFillTask(void* arg) {
 
           content_len = -1;
           bytes_seen  = 0;
-          while (!connect_current(content_len)) vTaskDelay(pdMS_TO_TICKS(200));
+
+          while (!connect_current(content_len)) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+          }
+
           wrote = 0;
           break;
         }
+
         vTaskDelay(pdMS_TO_TICKS(1));
         continue;
       }
@@ -921,9 +986,9 @@ static void httpFillTask(void* arg) {
 
       int n = sock.read(dst + (MAX_CHUNK_SIZE - need), toRead);
       if (n > 0) {
-        need       -= (size_t)n;
-        wrote      += (size_t)n;
-        bytes_seen += n;
+        need        -= (size_t)n;
+        wrote       += (size_t)n;
+        bytes_seen  += n;
         soft_deadline = millis() + 1200;
       } else {
         break;
@@ -932,21 +997,24 @@ static void httpFillTask(void* arg) {
 
     if (wrote > 0) {
       // ====================== ID3v2 prefilter ======================
-      uint8_t* cur = dst;
+      uint8_t* cur        = dst;
       size_t   detect_len = wrote;   // bytes remaining after any ID3 peel
 
       if (!session_locked && !id3m.header_found) {
         // Try begin only at absolute stream start (first packet)
-        id3v2_try_begin(cur, detect_len, (uint64_t)(bytes_seen - wrote),
-                        (size_t)MAX_CHUNK_SIZE, &id3c);
+        id3v2_try_begin(cur,
+                        detect_len,
+                        (uint64_t)(bytes_seen - wrote),
+                        (size_t)MAX_CHUNK_SIZE,
+                        &id3c);
 
         if (id3c.collecting) {
           size_t taken = id3v2_consume(cur, detect_len, &id3c, &id3m);
-          cur += taken;
+          cur        += taken;
           detect_len -= taken;
+
           if (id3m.header_found) {
-            // Parsed successfully; you can print to TFT later using id3m fields
-            // (title/artist/album/year/track/genre)
+            // You can later display id3m.title / artist / album, etc.
           }
         }
       }
@@ -959,13 +1027,13 @@ static void httpFillTask(void* arg) {
         // Build a crossing-slot view from what remains
         uint8_t view[MAX_CHUNK_SIZE + 6];
         int     vlen = 0;
+
+        int cp = (detect_len > MAX_CHUNK_SIZE) ? MAX_CHUNK_SIZE : (int)detect_len;
         if (tail_valid) {
-          int cp = (detect_len > MAX_CHUNK_SIZE) ? MAX_CHUNK_SIZE : (int)detect_len;
-          memcpy(view, tail6, 6);
-          memcpy(view + 6, cur, cp);
+          memcpy(view,       tail6, 6);
+          memcpy(view + 6,   cur,   cp);
           vlen = 6 + cp;
         } else {
-          int cp = (detect_len > MAX_CHUNK_SIZE) ? MAX_CHUNK_SIZE : (int)detect_len;
           memcpy(view, cur, cp);
           vlen = cp;
         }
@@ -973,12 +1041,19 @@ static void httpFillTask(void* arg) {
         audetect::DetectResult dr{};
         if (audetect::detect_audio_format_strict(view, vlen, &dr)) {
           switch (dr.format) {
-            case audetect::AF_MP3:       tag_for_this_slot = SLOT_MP3; break;
+            case audetect::AF_MP3:
+              tag_for_this_slot = SLOT_MP3;
+              break;
             case audetect::AF_AAC_ADTS:
             case audetect::AF_AAC_LOAS:
-            case audetect::AF_AAC_ADIF:  tag_for_this_slot = SLOT_AAC; break;
-            default:                     tag_for_this_slot = SLOT_UNKNOWN; break;
+            case audetect::AF_AAC_ADIF:
+              tag_for_this_slot = SLOT_AAC;
+              break;
+            default:
+              tag_for_this_slot = SLOT_UNKNOWN;
+              break;
           }
+
           if (tag_for_this_slot != SLOT_UNKNOWN) {
             const int head_bias = tail_valid ? 6 : 0;
             int off = dr.offset - head_bias;
@@ -990,14 +1065,19 @@ static void httpFillTask(void* arg) {
             session_locked = true;
             tail_valid     = false;
 
-            Serial.printf("🪪 HTTP stamp: %s%s (offset %u) sess %u\n",
-                          (session_tag == SLOT_AAC ? "AAC" : "MP3"),
-                          (id3m.header_found ? " + ID3" : ""),
-                          (unsigned)offset_for_this_slot,
-                          (unsigned)my_session);
+            Serial.printf(
+              "🪪 HTTP stamp: %s%s (offset %u) sess %u\n",
+              (session_tag == SLOT_AAC ? "AAC" : "MP3"),
+              (id3m.header_found ? " + ID3" : ""),
+              (unsigned)offset_for_this_slot,
+              (unsigned)my_session
+            );
           } else {
-            if (detect_len >= 6) { memcpy(tail6, cur + detect_len - 6, 6); tail_valid = true; }
-            else if (detect_len > 0) {
+            // Update tail6 from the remaining data for cross-slot detection
+            if (detect_len >= 6) {
+              memcpy(tail6, cur + detect_len - 6, 6);
+              tail_valid = true;
+            } else if (detect_len > 0) {
               if (tail_valid) {
                 memmove(tail6, tail6 + detect_len, 6 - detect_len);
                 memcpy(tail6 + (6 - detect_len), cur, detect_len);
@@ -1009,8 +1089,11 @@ static void httpFillTask(void* arg) {
             }
           }
         } else {
-          if (detect_len >= 6) { memcpy(tail6, cur + detect_len - 6, 6); tail_valid = true; }
-          else if (detect_len > 0) {
+          // No header yet; slide tail window
+          if (detect_len >= 6) {
+            memcpy(tail6, cur + detect_len - 6, 6);
+            tail_valid = true;
+          } else if (detect_len > 0) {
             if (tail_valid) {
               memmove(tail6, tail6 + detect_len, 6 - detect_len);
               memcpy(tail6 + (6 - detect_len), cur, detect_len);
@@ -1040,7 +1123,8 @@ static void httpFillTask(void* arg) {
     // Natural EOF → graceful drain → next track
     if (content_len > 0 && bytes_seen >= content_len) {
       stream_running = false;
-      http.end(); sock.stop();
+      http.end();
+      sock.stop();
 
       uint32_t t0 = millis();
       while (net_filled_slots() > 0 || pcm_buffer_percent() > 0) {
@@ -1061,15 +1145,17 @@ static void httpFillTask(void* arg) {
       id3v2_reset_collector(&id3c);
       id3v2_reset_meta(&id3m);
 
-      content_len = -1;
-      bytes_seen  = 0;
-      while (!connect_current(content_len)) vTaskDelay(pdMS_TO_TICKS(200));
+      content_len   = -1;
+      bytes_seen    = 0;
+      stall_retries = 0;  // new track, fresh retry budget
+
+      while (!connect_current(content_len)) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+      }
       continue;
     }
 
-    //TickType_t last_wake = xTaskGetTickCount();
-    //vTaskDelayUntil(&last_wake, 1);
-    //vTaskDelay(pdMS_TO_TICKS(1));  // let WiFi run
+    // vTaskDelay(pdMS_TO_TICKS(1));  // optional: let WiFi breathe
   }
 }
 
