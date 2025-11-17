@@ -557,7 +557,7 @@ void lvgl_start_task() {
         ui_update_stats_bars(net_pct , pcm_pct);
 
         //ui_update_stats_wifi(g_ui, WiFi.status(), WiFi.localIP().toString().c_str());
-        //ui_update_stats_decoder(g_ui, codec_name_from_enum(feed_codec), currentMP3Info.samplerate, currentMP3Info.channels, currentMP3Info.kbps);
+        ui_update_stats_decoder(codec_name_from_enum(feed_codec), currentMP3Info.samplerate, currentMP3Info.channels, currentMP3Info.kbps);
         //ui_update_stats_outputs(g_ui, i2s_output, a2dp_connected, a2dp_connected_name);
 
         //ui_update_player_id3(g_ui, true, id3m.artist, id3m.title, id3m.album, (int)id3m.track);
@@ -1965,16 +1965,23 @@ static void eq_reset_all() {
 
 // Process interleaved S16 stereo in-place (len = number of int16_t samples)
 static inline void eq_process_block(int16_t* pcm, size_t len) {
-  if (!g_eq_enabled) return;
+  if (!g_eq_enabled || !pcm || len < 2) return;
 
-  // Quick bypass if every band is 0 dB
+  // Take EQ snapshot & decision under a single lock
+  Biquad local_eq[EQ_BANDS];
+  float  local_gain_db[EQ_BANDS];
+
+  portENTER_CRITICAL(&g_eq_mux);
   bool allZero = true;
   for (int i = 0; i < EQ_BANDS; ++i) {
-    if (fabsf(g_eq_gain_db[i]) > 1e-6f) {
+    local_eq[i]       = g_eq[i];           // copy coeffs + state
+    local_gain_db[i]  = g_eq_gain_db[i];
+    if (fabsf(local_gain_db[i]) > 1e-6f) {
       allZero = false;
-      break;
     }
   }
+  portEXIT_CRITICAL(&g_eq_mux);
+
   if (allZero) return;
 
   // Work in floats for stability, clamp back to S16
@@ -1983,25 +1990,32 @@ static inline void eq_process_block(int16_t* pcm, size_t len) {
     float xL = (float)pcm[i + 0] / 32768.0f;
     float xR = (float)pcm[i + 1] / 32768.0f;
 
-    portENTER_CRITICAL(&g_eq_mux);
+    // Apply all bands using *local* coeffs/states
     for (int b = 0; b < EQ_BANDS; ++b) {
+      const Biquad& c = local_eq[b];
+
       // Skip true bypass band (b0==1,b1=b2=a1=a2=0)
-      if (fabsf(g_eq[b].b0 - 1.0f) < 1e-6f && fabsf(g_eq[b].b1) < 1e-6f && fabsf(g_eq[b].b2) < 1e-6f && fabsf(g_eq[b].a1) < 1e-6f && fabsf(g_eq[b].a2) < 1e-6f) continue;
+      if (fabsf(c.b0 - 1.0f) < 1e-6f &&
+          fabsf(c.b1)        < 1e-6f &&
+          fabsf(c.b2)        < 1e-6f &&
+          fabsf(c.a1)        < 1e-6f &&
+          fabsf(c.a2)        < 1e-6f) {
+        continue;
+      }
 
       // Left
-      float yL = g_eq[b].b0 * xL + g_eq[b].z1L;
-      g_eq[b].z1L = g_eq[b].b1 * xL - g_eq[b].a1 * yL + g_eq[b].z2L;
-      g_eq[b].z2L = g_eq[b].b2 * xL - g_eq[b].a2 * yL;
+      float yL = c.b0 * xL + local_eq[b].z1L;
+      local_eq[b].z1L = c.b1 * xL - c.a1 * yL + local_eq[b].z2L;
+      local_eq[b].z2L = c.b2 * xL - c.a2 * yL;
 
       // Right
-      float yR = g_eq[b].b0 * xR + g_eq[b].z1R;
-      g_eq[b].z1R = g_eq[b].b1 * xR - g_eq[b].a1 * yR + g_eq[b].z2R;
-      g_eq[b].z2R = g_eq[b].b2 * xR - g_eq[b].a2 * yR;
+      float yR = c.b0 * xR + local_eq[b].z1R;
+      local_eq[b].z1R = c.b1 * xR - c.a1 * yR + local_eq[b].z2R;
+      local_eq[b].z2R = c.b2 * xR - c.a2 * yR;
 
       xL = yL;
       xR = yR;
     }
-    portEXIT_CRITICAL(&g_eq_mux);
 
     // soft clamp
     if (xL > 1.0f) xL = 1.0f;
@@ -2012,8 +2026,19 @@ static inline void eq_process_block(int16_t* pcm, size_t len) {
     pcm[i + 0] = (int16_t)lrintf(xL * 32767.0f);
     pcm[i + 1] = (int16_t)lrintf(xR * 32767.0f);
   }
+
+  // Push updated states back once at the end
+  portENTER_CRITICAL(&g_eq_mux);
+  for (int i = 0; i < EQ_BANDS; ++i) {
+    g_eq[i].z1L = local_eq[i].z1L;
+    g_eq[i].z2L = local_eq[i].z2L;
+    g_eq[i].z1R = local_eq[i].z1R;
+    g_eq[i].z2R = local_eq[i].z2R;
+  }
+  portEXIT_CRITICAL(&g_eq_mux);
 }
 
+// Process interleaved S16 stereo in-place (len = number of int16_t samples)< 1e-6f) continue
 void onA2DPConnected(const uint8_t* bda) {
   a2dp_connected = true;
   memcpy(a2dp_connected_bda, bda, sizeof(esp_bd_addr_t));
@@ -2081,31 +2106,62 @@ void aacDataCallback(AACFrameInfo& info, int16_t* pcm, size_t len, void*) {
 }
 
 // --- MP3 -> PCM callback (shared ring writer; no I2S buffer)
+// --- MP3 -> PCM callback (shared ring writer; no I2S buffer)
 void mp3dataCallback(MP3FrameInfo& info, int16_t* pcm, size_t len, void*) {
   if (!pcm || len == 0) return;
 
+  // Resolve total interleaved samples (int16_t units)
   size_t total_samples = len;
 #ifdef LEN_IS_SAMPLES_PER_CHANNEL
   if (info.nChans > 0) total_samples *= (size_t)info.nChans;
 #endif
+  // Ensure we don't split a stereo pair if nChans==2
   if (info.nChans == 2 && (total_samples & 1U)) total_samples -= 1U;
   if (total_samples == 0) return;
 
-  // OLED/status
-  currentMP3Info.samplerate = (uint16_t)info.samprate;
-  currentMP3Info.channels   = (uint8_t)info.nChans;
+  // --- Lightweight status update (throttled) ---
+  static uint32_t last_bitrate = 0;
+  static uint16_t last_sr      = 0;
+  static uint8_t  last_ch      = 0;
+  static uint8_t  last_layer   = 0;
+  static uint8_t  frame_mod    = 0;
 
-  int kbps = (info.bitrate > 0) ? (info.bitrate / 1000) : 0;
-  if (kbps < 8 || kbps > 512) kbps = 0;  // sanity clamp
-  currentMP3Info.kbps  = (uint16_t)kbps;
-  currentMP3Info.layer = (uint8_t)info.layer;
+  const uint32_t cur_bitrate = (uint32_t)info.bitrate;
+  const uint16_t cur_sr      = (uint16_t)info.samprate;
+  const uint8_t  cur_ch      = (uint8_t)info.nChans;
+  const uint8_t  cur_layer   = (uint8_t)info.layer;
 
-  static uint16_t last_eq_sr = 0;
-  if (last_eq_sr != currentMP3Info.samplerate) {
-    eq_set_samplerate((int)currentMP3Info.samplerate);
-    last_eq_sr = currentMP3Info.samplerate;
+  bool changed =
+      (cur_bitrate != last_bitrate) ||
+      (cur_sr      != last_sr)      ||
+      (cur_ch      != last_ch)      ||
+      (cur_layer   != last_layer);
+
+  // Only touch global status every 4 frames or if something actually changed
+  if (++frame_mod >= 4 || changed) {
+    frame_mod    = 0;
+    last_bitrate = cur_bitrate;
+    last_sr      = cur_sr;
+    last_ch      = cur_ch;
+    last_layer   = cur_layer;
+
+    currentMP3Info.samplerate = cur_sr;
+    currentMP3Info.channels   = cur_ch;
+
+    int kbps = (last_bitrate > 0) ? (int)(last_bitrate / 1000U) : 0;
+    if (kbps < 8 || kbps > 512) kbps = 0;  // sanity clamp
+    currentMP3Info.kbps  = (uint16_t)kbps;
+    currentMP3Info.layer = cur_layer;
+
+    // Only touch EQ samplerate when it actually changes
+    static uint16_t last_eq_sr = 0;
+    if (last_eq_sr != cur_sr) {
+      eq_set_samplerate((int)cur_sr);
+      last_eq_sr = cur_sr;
+    }
   }
 
+  // --- EQ + ring write (hot path) ---
   eq_process_block(pcm, total_samples);  // interleaved S16
   const size_t pcm_bytes = total_samples * sizeof(int16_t);
   ring_write_pcm_shared(reinterpret_cast<uint8_t*>(pcm), pcm_bytes);
