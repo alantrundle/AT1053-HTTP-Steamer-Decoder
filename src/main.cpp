@@ -75,7 +75,7 @@
 // TFT inludes
 #include <lvgl.h>
 #include "gfxDriver.h"   // provides: extern LGFX_ST7796 display;
-#include "ui/ui_app.h"        // your UI (bars + keyboard)
+#include "ui/ui.h"        // your UI (bars + keyboard)
 
 // Add once at the top of the file:
 #include "driver/periph_ctrl.h"  // periph_module_disable/enable on ESP32
@@ -405,9 +405,6 @@ WiFiStatus wifi_status;
 static lv_display_t *lv_disp = nullptr;
 static lv_color_t *lvbuf1 = nullptr;
 static lv_color_t *lvbuf2 = nullptr;
-
-// UI context
-UIApp* g_ui = nullptr;
 // End LVGL
 
 // ---- forward decls ----
@@ -537,8 +534,8 @@ void setupTFT() {
   lv_indev_set_display(indev, lv_disp);
 
   // --- Build your UI (bars + keyboard, maps in FLASH) ---
-  //g_ui = ui_init();
-  g_ui = ui_init();
+ 
+  ui_init();
 
   Serial.println("[LVGL] TFT setup done");
 }
@@ -556,15 +553,16 @@ void lvgl_start_task() {
       for (;;) {
         const int net_pct = (net_filled_slots() * 100) / NUM_BUFFERS;
         const int pcm_pct  = pcm_buffer_percent();
-        ui_update_stats_bars(g_ui, net_pct , pcm_pct);
+        //ui_update_stats_bars(g_ui, net_pct , pcm_pct);
 
-        ui_update_stats_wifi(g_ui, WiFi.status(), WiFi.localIP().toString().c_str());
-        ui_update_stats_decoder(g_ui, codec_name_from_enum(feed_codec), currentMP3Info.samplerate, currentMP3Info.channels, currentMP3Info.kbps);
-        ui_update_stats_outputs(g_ui, i2s_output, a2dp_connected, a2dp_connected_name);
+        //ui_update_stats_wifi(g_ui, WiFi.status(), WiFi.localIP().toString().c_str());
+        //ui_update_stats_decoder(g_ui, codec_name_from_enum(feed_codec), currentMP3Info.samplerate, currentMP3Info.channels, currentMP3Info.kbps);
+        //ui_update_stats_outputs(g_ui, i2s_output, a2dp_connected, a2dp_connected_name);
 
-        ui_update_player_id3(g_ui, true, id3m.artist, id3m.title, id3m.album, (int)id3m.track);
+        //ui_update_player_id3(g_ui, true, id3m.artist, id3m.title, id3m.album, (int)id3m.track);
 
         lv_timer_handler();
+        ui_tick();
 
         vTaskDelayUntil(&last, period);  
       }

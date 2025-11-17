@@ -4,6 +4,8 @@
 /* Let LVGL find this header by name */
 #define LV_CONF_INCLUDE_SIMPLE 1
 
+#define LV_MEM_CUSTOM 1
+
 #define LV_MEM_SIZE (32U * 1024U)    /*32 [bytes]*/
 
 
