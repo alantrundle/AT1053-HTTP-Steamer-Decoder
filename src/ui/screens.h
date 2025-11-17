@@ -12,12 +12,22 @@ typedef struct _objects_t {
     lv_obj_t *obj0;
     lv_obj_t *stats_lbl_pct_net;
     lv_obj_t *stats_lbl_pct_pcm;
-    lv_obj_t *stats_bar_pcm;
     lv_obj_t *stats_bar_net;
-    lv_obj_t *stats_lbl_codec;
-    lv_obj_t *stats_lbl_samplerate;
-    lv_obj_t *stats_lbl_channels;
+    lv_obj_t *stats_bar_pcm;
     lv_obj_t *stats_lbl_bitrate;
+    lv_obj_t *stats_lbl_channels;
+    lv_obj_t *stats_lbl_samplerate;
+    lv_obj_t *stats_lbl_codec;
+    lv_obj_t *stats_lbl_a2dp_name;
+    lv_obj_t *stats_lbl_i2s_on;
+    lv_obj_t *stats_lbl_a2dp_on;
+    lv_obj_t *stats_lbl_a2dp_name_1;
+    lv_obj_t *stats_lbl_i2s_on_1;
+    lv_obj_t *stats_lbl_a2dp_on_1;
+    lv_obj_t *stats_lbl_bitrate_1;
+    lv_obj_t *stats_lbl_wifi_ssid;
+    lv_obj_t *stats_lbl_wifi_ipaddress;
+    lv_obj_t *stats_lbl_wifi_on;
 } objects_t;
 
 extern objects_t objects;

@@ -186,7 +186,7 @@ int track_pause_length = 1; // seconds (set to 0 to disable)
 
 // --- HTTP ring buffer in PSRAM - 256 × 1024 (256KB) ---
 #define MAX_CHUNK_SIZE 1024
-#define NUM_BUFFERS 256
+#define NUM_BUFFERS 512
 
 EXT_RAM_ATTR  static uint8_t* net_pool = nullptr;                     // PSRAM pool
 EXT_RAM_ATTR static uint8_t* netBuffers[NUM_BUFFERS] = { nullptr };  // slot pointers
@@ -555,15 +555,12 @@ void lvgl_start_task() {
         const int net_pct = (net_filled_slots() * 100) / NUM_BUFFERS;
         const int pcm_pct  = pcm_buffer_percent();
         ui_update_stats_bars(net_pct , pcm_pct);
-
-        //ui_update_stats_wifi(g_ui, WiFi.status(), WiFi.localIP().toString().c_str());
         ui_update_stats_decoder(codec_name_from_enum(feed_codec), currentMP3Info.samplerate, currentMP3Info.channels, currentMP3Info.kbps);
-        //ui_update_stats_outputs(g_ui, i2s_output, a2dp_connected, a2dp_connected_name);
-
+        ui_update_stats_outputs(i2s_output, a2dp_connected, a2dp_connected_name);
+        ui_update_stats_wifi(WiFi.status(), WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
         //ui_update_player_id3(g_ui, true, id3m.artist, id3m.title, id3m.album, (int)id3m.track);
 
         lv_timer_handler();
-        //ui_tick();
 
         vTaskDelayUntil(&last, period);  
       }
@@ -1070,8 +1067,9 @@ static void httpFillTask(void* arg) {
       continue;
     }
 
-    TickType_t last_wake = xTaskGetTickCount();
-    vTaskDelayUntil(&last_wake, 1);
+    //TickType_t last_wake = xTaskGetTickCount();
+    //vTaskDelayUntil(&last_wake, 1);
+    //vTaskDelay(pdMS_TO_TICKS(1));  // let WiFi run
   }
 }
 
@@ -2613,63 +2611,96 @@ static inline int get_next_filled_slot() {
 // Runs on its own task: consumes NET ring slots, selects codec from gNet,
 // trims with netOffset, and feeds Helix. Hysteresis: pause >=90%, resume <=50%
 // Runs periodically: one decode step per tick, bounded work, no extra sleeps.
-// Adaptive, periodic decoder: adjusts cadence/budget by buffer levels and NET backlog
+// Adaptive, periodic decoder: adjusts cadence/budget by buffer levels and NET backloggh
 void decodeTask(void* /*param*/) {
-  // ---- Hysteresis as bytes (no per-loop division) ----
-  constexpr int HI_PCT = 90;     // pause when >= 90%
-  constexpr int LO_PCT = 40;     // resume when <= 50%
-  const size_t HI_BYTES = (A2DP_BUFFER_SIZE * HI_PCT) / 100;
-  const size_t LO_BYTES = (A2DP_BUFFER_SIZE * LO_PCT) / 100;
 
-  // ---- Period presets (ms) + per-tick slot budgets ----
+  // ---- Hysteresis thresholds ----
+  constexpr int HI_PCT    = 70;    // pause decode when >= 90%
+  constexpr int LO_PCT    = 50;    // resume decode when <= 20%
+  constexpr int PRIME_PCT = 80;    // NET must reach 80% before decoding
+
+  const size_t HI_BYTES    = (A2DP_BUFFER_SIZE * HI_PCT) / 100;
+  const size_t LO_BYTES    = (A2DP_BUFFER_SIZE * LO_PCT) / 100;
+  const size_t PRIME_SLOTS = (NUM_BUFFERS      * PRIME_PCT) / 100;
+
+  // ---- Period presets ----
   constexpr TickType_t PERIOD_FAST = pdMS_TO_TICKS(2);
   constexpr TickType_t PERIOD_NORM = pdMS_TO_TICKS(2);
   constexpr TickType_t PERIOD_SLOW = pdMS_TO_TICKS(5);
-  constexpr int        BUDGET_FAST = 2;   // process up to 2 NET slots/tick
-  constexpr int        BUDGET_NORM = 2;
-  constexpr int        BUDGET_SLOW = 1;
 
-  // ---- State ----
+  constexpr int BUDGET_FAST = 2;
+  constexpr int BUDGET_NORM = 2;
+  constexpr int BUDGET_SLOW = 1;
+
+  // ---- Decoder state ----
   CodecKind active_codec = CODEC_UNKNOWN;
-  bool mp3_begun = false, aac_begun = false;
+  bool mp3_begun = false;
+  bool aac_begun = false;
+
+  // Force first session mismatch
   uint32_t last_session = 0xFFFFFFFFu;
 
   decoder_paused = false;
   output_ready   = true;
 
+  bool priming = true;   // NET priming
+
   // ---- Helpers ----
   auto dist = [](size_t r, size_t w, size_t cap)->size_t {
     return (w >= r) ? (w - r) : (cap - (r - w));
   };
+
   auto tag_to_codec = [](uint8_t tag)->CodecKind {
-    if (tag == (uint8_t)SLOT_MP3) return CODEC_MP3;
-    if (tag == (uint8_t)SLOT_AAC) return CODEC_AAC;
+    if (tag == SLOT_MP3) return CODEC_MP3;
+    if (tag == SLOT_AAC) return CODEC_AAC;
     return CODEC_UNKNOWN;
   };
-  auto end_active = [&](){
-    if (active_codec == CODEC_MP3 && mp3_begun) { mp3.end(); mp3_begun = false; }
-    if (active_codec == CODEC_AAC && aac_begun) { aac.end(); aac_begun = false; }
-    active_codec = CODEC_UNKNOWN;
-  };
+
   auto begin_codec = [&](CodecKind k){
-    if (k == CODEC_MP3) { if (!mp3_begun) mp3.begin(); mp3_begun = true; }
-    if (k == CODEC_AAC) { if (!aac_begun) aac.begin(); aac_begun = true; }
+    if (k == CODEC_MP3 && !mp3_begun) { mp3.begin(); mp3_begun = true; }
+    if (k == CODEC_AAC && !aac_begun) { aac.begin(); aac_begun = true; }
     active_codec = k;
   };
-  auto net_backlog = [&]()->int {
+
+  auto end_codec = [&](){
+    if (mp3_begun) { mp3.end(); mp3_begun = false; }
+    if (aac_begun) { aac.end(); aac_begun = false; }
+    active_codec = CODEC_UNKNOWN;
+  };
+
+  auto net_backlog = [&](){
     int c = 0;
-    for (int i = 0; i < NUM_BUFFERS; ++i) if (netBufFilled[i]) ++c;
+    for (int i = 0; i < NUM_BUFFERS; ++i)
+      if (netBufFilled[i]) c++;
     return c;
   };
 
-  // ---- Periodic scheduler ----
+  // ---- Scheduler ----
   TickType_t period    = PERIOD_NORM;
   TickType_t last_wake = xTaskGetTickCount();
 
+  // ==========================================================================
+  //                            MAIN LOOP
+  // ==========================================================================
   for (;;) {
     vTaskDelayUntil(&last_wake, period);
 
-    // Snapshot PCM indices (one short CS)
+    const int backlog = net_backlog();
+
+    // ============================================================
+    //                NET PRIMING BEFORE DECODING
+    // ============================================================
+    if (priming) {
+      if (backlog >= PRIME_SLOTS) {
+        priming = false;
+        decoder_paused = false;
+        Serial.printf("[DEC] NET primed (%d slots)\n", backlog);
+      } else {
+        continue;   // wait for NET fill
+      }
+    }
+
+    // ---- Snapshot PCM indices ----
     size_t w, rA, rI;
     portENTER_CRITICAL(&a2dp_mux);
     w  = a2dp_write_index;
@@ -2677,69 +2708,97 @@ void decodeTask(void* /*param*/) {
     rI = a2dp_read_index_i2s;
     portEXIT_CRITICAL(&a2dp_mux);
 
-    // Hysteresis (OR logic across A2DP / I2S readers)
     const size_t dA = dist(rA, w, A2DP_BUFFER_SIZE);
     const size_t dI = dist(rI, w, A2DP_BUFFER_SIZE);
 
-    if (!decoder_paused && (dA >= HI_BYTES || dI >= HI_BYTES)) decoder_paused = true;
-    if ( decoder_paused && (dA <= LO_BYTES || dI <= LO_BYTES)) decoder_paused = false;
-
-    // Adaptive cadence/budget
-    int slots_budget;
-    if (decoder_paused || g_pause != PAUSE_RUNNING) {
-      period = PERIOD_NORM;      // idle at normal tick
+    // ============================================================
+    //              OUTPUT-READY GATING (A2DP / I2S / BOTH)
+    // ============================================================
+    //
+    // Decode ONLY when at least one output path can consume PCM.
+    // i2s_output      -> I2S path enabled and always ready
+    // a2dp_audio_ready -> A2DP Bluetooth audio active
+    //
+    // Unified condition:
+    //       i2s_output OR a2dp_audio_ready
+    //
+    if (!(i2s_output || a2dp_audio_ready)) {
+      period = PERIOD_NORM;
       continue;
-    } else {
-      // Speed up if PCM lean OR many NET slots queued; slow down if very full
-      const int backlog = net_backlog();
-      if (dA < LO_BYTES || dI < LO_BYTES || backlog >= (NUM_BUFFERS * 3 / 4)) {
-        period = PERIOD_FAST;    slots_budget = BUDGET_FAST;
-      } else if (dA > HI_BYTES*9/10 && dI > HI_BYTES*9/10) { // extra cushion near high
-        period = PERIOD_SLOW;    slots_budget = BUDGET_SLOW;
-      } else {
-        period = PERIOD_NORM;    slots_budget = BUDGET_NORM;
-      }
     }
 
-    // Process up to N slots this tick (bounded work)
+    // ============================================================
+    //                PCM BUFFER HYSTERESIS
+    // ============================================================
+    if (!decoder_paused && (dA >= HI_BYTES || dI >= HI_BYTES))
+      decoder_paused = true;
+
+    if (decoder_paused && (dA <= LO_BYTES || dI <= LO_BYTES))
+      decoder_paused = false;
+
+    if (decoder_paused) {
+      period = PERIOD_NORM;
+      continue;
+    }
+
+    // ============================================================
+    //     ADAPTIVE CADENCE BASED ON PCM + NET BACKLOG
+    // ============================================================
+    int slots_budget;
+    if (dA < LO_BYTES || dI < LO_BYTES || backlog >= (NUM_BUFFERS * 3 / 4)) {
+      period = PERIOD_FAST; slots_budget = BUDGET_FAST;
+    } else if (dA > HI_BYTES * 9 / 10 && dI > HI_BYTES * 9 / 10) {
+      period = PERIOD_SLOW; slots_budget = BUDGET_SLOW;
+    } else {
+      period = PERIOD_NORM; slots_budget = BUDGET_NORM;
+    }
+
+    // ============================================================
+    //                     DECODE LOOP
+    // ============================================================
     while (slots_budget-- > 0) {
-      if (!netBufFilled[netRead]) break;
 
-      const int      slot   = netRead;
-      uint8_t*       ptr    = netBuffers[slot];
-      uint16_t       bytes  = netSize[slot];
-      const uint32_t sess   = netSess[slot];
-      const uint8_t  tag    = netTag[slot];
-      const uint16_t offset = netOffset[slot];
+      if (!netBufFilled[netRead])
+        break;
 
-      // Codec/session switch (no PCM flush)
-      const CodecKind want = tag_to_codec(tag);
+      int slot = netRead;
+      uint8_t* ptr    = netBuffers[slot];
+      uint16_t bytes  = netSize[slot];
+      uint32_t sess   = netSess[slot];
+      uint8_t  tag    = netTag[slot];
+      uint16_t offset = netOffset[slot];
+
+      // ---- Session changed? ----
       if (sess != last_session) {
-        end_active();
-        if (want != CODEC_UNKNOWN) begin_codec(want);
-        feed_codec   = want;
+        priming = true;         // re-prime on new track
+        end_codec();
+        feed_codec = CODEC_UNKNOWN;
         last_session = sess;
-      } else if (want != CODEC_UNKNOWN && want != active_codec) {
-        end_active();
-        begin_codec(want);
-        feed_codec = want;
-      } else {
-        feed_codec = active_codec;
+        Serial.printf("[DEC] NEW SESSION %u\n", sess);
+        break;
       }
 
-      // Trim first packet (later packets have offset=0)
-      if (ptr && bytes > 0 && offset > 0 && offset < bytes) {
+      // ---- Codec selection ----
+      CodecKind want = tag_to_codec(tag);
+      if (want != active_codec && want != CODEC_UNKNOWN) {
+        feed_codec = want;
+        end_codec();
+        begin_codec(want);
+      }
+
+      // ---- Apply audio header offset ----
+      if (offset > 0 && offset < bytes) {
         ptr   += offset;
         bytes -= offset;
       }
 
-      // Feed Helix
+      // ---- Feed codec ----
       if (bytes > 0) {
-        if (active_codec == CODEC_MP3)      (void)mp3.write(ptr, (int32_t)bytes);
-        else if (active_codec == CODEC_AAC) (void)aac.write(ptr, (int32_t)bytes);
+        if (active_codec == CODEC_MP3)      mp3.write(ptr, bytes);
+        else if (active_codec == CODEC_AAC) aac.write(ptr, bytes);
       }
 
-      // Release slot
+      // ---- Release NET slot ----
       netBufFilled[slot] = false;
       netSize[slot]      = 0;
       netRead = (slot + 1) % NUM_BUFFERS;
@@ -2748,7 +2807,6 @@ void decodeTask(void* /*param*/) {
 
   TASK_NEVER_RETURN();
 }
-
 
 // ──────────────────────────────────────────────
 // I²S playback: dual-reader on the shared PCM ring

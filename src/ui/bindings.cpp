@@ -93,6 +93,96 @@ void ui_update_stats_decoder(const char* codec,
     }
 }
 
+void ui_update_stats_outputs(bool i2s_on,
+                             bool a2dp_on,
+                             const char* a2dp_name)
+{
+    static bool last_i2s_on  = 0;
+    static bool last_a2dp_on = 0;
+    static char last_name[32] = "";
+
+    char buf[32];
+
+    /* ---------------- I2S OUTPUT STATE ---------------- */
+    if (i2s_on != last_i2s_on) {
+        last_i2s_on = i2s_on;
+
+        if (objects.stats_lbl_i2s_on) {
+            lv_label_set_text(objects.stats_lbl_i2s_on,
+                              i2s_on ? "ON" : "OFF");
+        }
+    }
+
+    /* ---------------- A2DP OUTPUT STATE ---------------- */
+    if (a2dp_on != last_a2dp_on) {
+        last_a2dp_on = a2dp_on;
+
+        if (objects.stats_lbl_a2dp_on) {
+            lv_label_set_text(objects.stats_lbl_a2dp_on,
+                              a2dp_on ? "ON" : "OFF");
+        }
+    }
+
+    /* ---------------- A2DP DEVICE NAME ---------------- */
+    if (a2dp_name && strcmp(a2dp_name, last_name) != 0) {
+        strncpy(last_name, a2dp_name, sizeof(last_name));
+        last_name[sizeof(last_name)-1] = '\0';
+
+        if (objects.stats_lbl_a2dp_name) {
+            if (a2dp_on)
+                lv_label_set_text(objects.stats_lbl_a2dp_name, last_name);
+            else
+                lv_label_set_text(objects.stats_lbl_a2dp_name, "—");
+        }
+    }
+}
+
+void ui_update_stats_wifi(bool connected,
+                          const char* ssid,
+                          const char* ip)
+{
+    static bool  last_connected = false;
+    static char  last_ssid[32]  = "";
+    static char  last_ip[32]    = "";
+
+    /* ---------------- WIFI STATE ---------------- */
+    if (connected != last_connected) {
+        last_connected = connected;
+
+        if (objects.stats_lbl_wifi_on) {
+            lv_label_set_text(objects.stats_lbl_wifi_on,
+                              connected ? "Connected"
+                                        : "Disconnected");
+        }
+    }
+
+    /* ---------------- SSID / AP NAME ---------------- */
+    const char* ssid_safe = (ssid && *ssid) ? ssid : "—";
+
+    if (strcmp(ssid_safe, last_ssid) != 0) {
+        strncpy(last_ssid, ssid_safe, sizeof(last_ssid));
+        last_ssid[sizeof(last_ssid)-1] = '\0';
+
+        if (objects.stats_lbl_wifi_ssid) {
+            lv_label_set_text(objects.stats_lbl_wifi_ssid, last_ssid);
+        }
+    }
+
+    /* ---------------- IP ADDRESS ---------------- */
+    const char* ip_safe = (connected && ip && *ip) ? ip : "0.0.0.0";
+
+    if (strcmp(ip_safe, last_ip) != 0) {
+        strncpy(last_ip, ip_safe, sizeof(last_ip));
+        last_ip[sizeof(last_ip)-1] = '\0';
+
+        if (objects.stats_lbl_wifi_ipaddress) {
+            lv_label_set_text(objects.stats_lbl_wifi_ipaddress, last_ip);
+        }
+    }
+}
+
+
+
 
 
 
