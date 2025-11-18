@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stdarg.h>  // add near other C headers
 #include <stdio.h>
+
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -232,9 +233,6 @@ volatile bool stream_running = false; // HTTP stream started/ stopped (EOF)
 // keep timestamp global so it persists between loop() calls
 static uint32_t lastStackDump = 0;
 
-// setup - bluetooth stack init
-static bool g_bt_profiles_registered = false;
-
 // --- Radio poll state (used by loop() logger) ---
 
 volatile uint32_t g_lastNetWriteMs = 0;    // set each time httpFill publishes a slot
@@ -314,10 +312,6 @@ enum CodecKind : uint8_t { CODEC_UNKNOWN = 0,
 
 volatile CodecKind feed_codec = CODEC_UNKNOWN;
 
-// ---- SPI clock activity monitor ----
-volatile uint32_t g_spi_setup_count = 0;  // increments each time a master transaction begins
-volatile uint32_t g_spi_done_count = 0;   // increments each time a transaction completes
-// We don’t call millis() inside ISRs; we count edges and time them in the task.
 
 // ─────────────────────────────────────────────────────────────────────
 //                    A2DP device picker (scan → menu → connect)
@@ -540,8 +534,6 @@ void setupTFT() {
 
   Serial.println("[LVGL] TFT setup done");
 }
-
-static ID3v2Meta g_id3;
 
 // Call once after lv_init() + driver registration
 void lvgl_start_task() {
@@ -775,7 +767,8 @@ static SlotCodec guess_slot_codec(const String& ctype, const char* url) {
   return SLOT_UNKNOWN;
 }
 
-static void httpFillTask(void* arg) {
+static void httpFillTask(void* arg)
+{
   ensure_wifi();
 
   HTTPClient http;
@@ -793,7 +786,7 @@ static void httpFillTask(void* arg) {
   int stall_retries = 0;
 
   // Session-scoped stamping state
-  SlotCodec session_tag = SLOT_UNKNOWN;
+  SlotCodec session_tag    = SLOT_UNKNOWN;
   bool      session_locked = false;
 
   // ID3v2 (per-session)
@@ -801,7 +794,7 @@ static void httpFillTask(void* arg) {
   id3v2_reset_collector(&id3c);
   id3v2_reset_meta(&id3m);
 
-  // Crossing-header helper until we lock
+  // Crossing-header helper
   uint8_t tail6[6] = {0};
   bool    tail_valid = false;
 
@@ -833,7 +826,6 @@ static void httpFillTask(void* arg) {
     stream_running      = true;
     g_new_track_pending = true;
 
-    // Reset stamping + ID3 state for new session
     session_tag    = SLOT_UNKNOWN;
     session_locked = false;
     tail_valid     = false;
@@ -854,14 +846,20 @@ static void httpFillTask(void* arg) {
   int64_t bytes_seen  = 0;
 
   while (!connect_current(content_len)) {
-    vTaskDelay(pdMS_TO_TICKS(250));
+    vTaskDelay(pdMS_TO_TICKS(200));
   }
-  bytes_seen      = 0;
-  stall_retries   = 0;
+  bytes_seen    = 0;
+  stall_retries = 0;
 
+  // =====================================================================
+  //                             MAIN LOOP
+  // =====================================================================
   for (;;) {
-    // Forced/implicit session change
+    bool streamed_any = false;   // did we actually publish a NET slot this pass?
+
+    // --- Session changed? ---
     if (g_play_session != my_session || g_force_next) {
+
       g_force_next    = false;
       stream_running  = false;
       http.end();
@@ -881,7 +879,7 @@ static void httpFillTask(void* arg) {
 
       content_len    = -1;
       bytes_seen     = 0;
-      stall_retries  = 0;   // new session/track → reset retries
+      stall_retries  = 0;
 
       while (!connect_current(content_len)) {
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -889,38 +887,45 @@ static void httpFillTask(void* arg) {
       continue;
     }
 
-    // Need a free NET slot
+    // --- Need free NET slot ---
     if (netBufFilled[netWrite]) {
+      // Ring is full; let decode catch up, don't spin
       vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
 
-    uint8_t* dst          = netBuffers[netWrite];
-    size_t   need         = MAX_CHUNK_SIZE;
-    size_t   wrote        = 0;
-    uint32_t soft_deadline = millis() + 1200;  // ~1.2s stall window
+    uint8_t* dst           = netBuffers[netWrite];
+    size_t   need          = MAX_CHUNK_SIZE;
+    size_t   wrote         = 0;
+    uint32_t soft_deadline = millis() + 1200;
 
+    // ======================================================
+    //                HIGH-THROUGHPUT READ LOOP
+    // ======================================================
     while (need > 0) {
+
+      // Session change mid-read
       if (g_play_session != my_session) {
         wrote = 0;
         break;
       }
 
-      // Enforce Content-Length if known
+      // Obey Content-Length
       if (content_len >= 0) {
         int64_t remain = content_len - bytes_seen;
-        if (remain <= 0) break; // EOF
+        if (remain <= 0) break;
         if ((int64_t)need > remain) need = (size_t)remain;
       }
 
       int avail = sock.available();
       if (avail <= 0) {
-        // No data ready
-        if (content_len >= 0 && bytes_seen >= content_len) break; // EOF
 
-        // Stalled?
+        // EOF?
+        if (content_len >= 0 && bytes_seen >= content_len) break;
+
+        // TCP stall?
         if (!sock.connected() || millis() > soft_deadline) {
-          // ---- Stall detected: drop this connection ----
+
           stream_running = false;
           http.end();
           sock.stop();
@@ -933,13 +938,13 @@ static void httpFillTask(void* arg) {
           id3v2_reset_collector(&id3c);
           id3v2_reset_meta(&id3m);
 
+          // -- retry same track up to MAX_TRACK_RETRIES --
           if (stall_retries < MAX_TRACK_RETRIES) {
             stall_retries++;
-            Serial.printf(
-              "[HTTP] Stall mid-track → retry %d/%d (sess=%u, bytes_seen=%lld)\n",
-              stall_retries, MAX_TRACK_RETRIES,
-              (unsigned)my_session, (long long)bytes_seen
-            );
+
+            Serial.printf("[HTTP] Stall → retry %d/%d (sess=%u)\n",
+                          stall_retries, MAX_TRACK_RETRIES,
+                          (unsigned)my_session);
 
             content_len = -1;
             bytes_seen  = 0;
@@ -947,61 +952,62 @@ static void httpFillTask(void* arg) {
             while (!connect_current(content_len)) {
               vTaskDelay(pdMS_TO_TICKS(200));
             }
-
             wrote = 0;
-            // We stay on the SAME track/session, just restarted it.
             break;
           }
 
-          // ---- Too many stalls → advance to next track ----
-          Serial.printf(
-            "[HTTP] Stall mid-track → giving up after %d retries → next track\n",
-            MAX_TRACK_RETRIES
-          );
-
-          stall_retries = 0;
+          // --- too many stalls → move to next track ---
+          Serial.printf("[HTTP] Stall → giving up after %d retries → next track\n",
+                        MAX_TRACK_RETRIES);
 
           current_track_index = (current_track_index + 1) % playlist_count;
           g_play_session      = (uint32_t)current_track_index;
           my_session          = g_play_session;
           g_new_track_pending = true;
 
-          content_len = -1;
-          bytes_seen  = 0;
+          stall_retries = 0;
+          content_len   = -1;
+          bytes_seen    = 0;
 
           while (!connect_current(content_len)) {
             vTaskDelay(pdMS_TO_TICKS(200));
           }
-
           wrote = 0;
           break;
         }
 
+        // No stall, no EOF, just no data YET → small nap
         vTaskDelay(pdMS_TO_TICKS(1));
         continue;
       }
 
+      // ---- We can read now ----
       int toRead = avail;
       if (toRead > (int)need) toRead = (int)need;
 
       int n = sock.read(dst + (MAX_CHUNK_SIZE - need), toRead);
+
       if (n > 0) {
-        need        -= (size_t)n;
-        wrote       += (size_t)n;
-        bytes_seen  += n;
+        need         -= (size_t)n;
+        wrote        += (size_t)n;
+        bytes_seen   += n;
         soft_deadline = millis() + 1200;
+        // keep pumping without extra delay
       } else {
         break;
       }
     }
 
+    // ======================================================
+    //        ID3, HEADER DETECTION, SLOT PUBLISHING
+    // ======================================================
     if (wrote > 0) {
-      // ====================== ID3v2 prefilter ======================
-      uint8_t* cur        = dst;
-      size_t   detect_len = wrote;   // bytes remaining after any ID3 peel
 
+      uint8_t* cur        = dst;
+      size_t   detect_len = wrote;
+
+      // --- ID3 peeling ---
       if (!session_locked && !id3m.header_found) {
-        // Try begin only at absolute stream start (first packet)
         id3v2_try_begin(cur,
                         detect_len,
                         (uint64_t)(bytes_seen - wrote),
@@ -1012,26 +1018,23 @@ static void httpFillTask(void* arg) {
           size_t taken = id3v2_consume(cur, detect_len, &id3c, &id3m);
           cur        += taken;
           detect_len -= taken;
-
-          if (id3m.header_found) {
-            // You can later display id3m.title / artist / album, etc.
-          }
         }
       }
 
-      // ====================== Header detection / stamping ======================
+      // --- Format stamping ---
       SlotCodec tag_for_this_slot    = session_tag;
       uint16_t  offset_for_this_slot = 0;
 
       if (!session_locked) {
-        // Build a crossing-slot view from what remains
+
         uint8_t view[MAX_CHUNK_SIZE + 6];
-        int     vlen = 0;
+        int vlen = 0;
 
         int cp = (detect_len > MAX_CHUNK_SIZE) ? MAX_CHUNK_SIZE : (int)detect_len;
+
         if (tail_valid) {
-          memcpy(view,       tail6, 6);
-          memcpy(view + 6,   cur,   cp);
+          memcpy(view, tail6, 6);
+          memcpy(view + 6, cur, cp);
           vlen = 6 + cp;
         } else {
           memcpy(view, cur, cp);
@@ -1040,18 +1043,13 @@ static void httpFillTask(void* arg) {
 
         audetect::DetectResult dr{};
         if (audetect::detect_audio_format_strict(view, vlen, &dr)) {
+
           switch (dr.format) {
-            case audetect::AF_MP3:
-              tag_for_this_slot = SLOT_MP3;
-              break;
+            case audetect::AF_MP3:        tag_for_this_slot = SLOT_MP3; break;
             case audetect::AF_AAC_ADTS:
             case audetect::AF_AAC_LOAS:
-            case audetect::AF_AAC_ADIF:
-              tag_for_this_slot = SLOT_AAC;
-              break;
-            default:
-              tag_for_this_slot = SLOT_UNKNOWN;
-              break;
+            case audetect::AF_AAC_ADIF:   tag_for_this_slot = SLOT_AAC; break;
+            default:                      tag_for_this_slot = SLOT_UNKNOWN; break;
           }
 
           if (tag_for_this_slot != SLOT_UNKNOWN) {
@@ -1059,54 +1057,28 @@ static void httpFillTask(void* arg) {
             int off = dr.offset - head_bias;
             if (off < 0) off = 0;
             if (off > (int)detect_len) off = (int)detect_len;
+
             offset_for_this_slot = (uint16_t)off;
 
             session_tag    = tag_for_this_slot;
             session_locked = true;
             tail_valid     = false;
-
-            Serial.printf(
-              "🪪 HTTP stamp: %s%s (offset %u) sess %u\n",
-              (session_tag == SLOT_AAC ? "AAC" : "MP3"),
-              (id3m.header_found ? " + ID3" : ""),
-              (unsigned)offset_for_this_slot,
-              (unsigned)my_session
-            );
           } else {
-            // Update tail6 from the remaining data for cross-slot detection
             if (detect_len >= 6) {
               memcpy(tail6, cur + detect_len - 6, 6);
               tail_valid = true;
-            } else if (detect_len > 0) {
-              if (tail_valid) {
-                memmove(tail6, tail6 + detect_len, 6 - detect_len);
-                memcpy(tail6 + (6 - detect_len), cur, detect_len);
-              } else {
-                memset(tail6, 0, 6 - detect_len);
-                memcpy(tail6 + (6 - detect_len), cur, detect_len);
-              }
-              tail_valid = true;
             }
           }
+
         } else {
-          // No header yet; slide tail window
           if (detect_len >= 6) {
             memcpy(tail6, cur + detect_len - 6, 6);
-            tail_valid = true;
-          } else if (detect_len > 0) {
-            if (tail_valid) {
-              memmove(tail6, tail6 + detect_len, 6 - detect_len);
-              memcpy(tail6 + (6 - detect_len), cur, detect_len);
-            } else {
-              memset(tail6, 0, 6 - detect_len);
-              memcpy(tail6 + (6 - detect_len), cur, detect_len);
-            }
             tail_valid = true;
           }
         }
       }
 
-      // Publish this slot (size = bytes left after ID3 peel)
+      // ---- Publish slot ----
       netSize[netWrite]      = (uint16_t)detect_len;
       netTag[netWrite]       = (uint8_t)tag_for_this_slot;
       netOffset[netWrite]    = offset_for_this_slot;
@@ -1117,11 +1089,15 @@ static void httpFillTask(void* arg) {
       g_httpBytesTick  += detect_len;
 
       netWrite = (netWrite + 1) % NUM_BUFFERS;
-      taskYIELD();
+
+      streamed_any = true;   // we actually produced data this iteration
     }
 
-    // Natural EOF → graceful drain → next track
+    // ======================================================
+    //                        EOF handling
+    // ======================================================
     if (content_len > 0 && bytes_seen >= content_len) {
+
       stream_running = false;
       http.end();
       sock.stop();
@@ -1147,7 +1123,7 @@ static void httpFillTask(void* arg) {
 
       content_len   = -1;
       bytes_seen    = 0;
-      stall_retries = 0;  // new track, fresh retry budget
+      stall_retries = 0;
 
       while (!connect_current(content_len)) {
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -1155,8 +1131,27 @@ static void httpFillTask(void* arg) {
       continue;
     }
 
-    // vTaskDelay(pdMS_TO_TICKS(1));  // optional: let WiFi breathe
+    // ======================================================
+    //          ONLY DELAY IF WE DIDN’T DO ANY WORK
+    // ======================================================
+    if (!streamed_any) {
+      // No slot published this loop → small delay so we don't hog CPU
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    // else: no delay → task time spent reading + ID3 + stamping is the "work",
+    // scheduler can preempt us as needed.
   }
+}
+
+bool player_start() {
+
+  if (a2dp_audio_ready || i2s_output) {
+    
+  }
+  request_pause_held();
+  stream_running = false;
+  Serial.println("[PLAYER] ⏹ Stop");
+  return true;
 }
 
 bool player_stop() {
@@ -1934,22 +1929,26 @@ int startI2S() {
   vTaskResume(i2sTaskHandle);
 
   portENTER_CRITICAL(&a2dp_mux);
-  if (cold_prime_mode) {
-    // Start I²S from the primed beginning
-    a2dp_read_index_i2s = cold_read_index;
-    // Keep A2DP reader where it is; it will be set on A2DP start
-    // Maintain a2dp_buffer_fill vs ACTIVE readers now that we have one
-    a2dp_buffer_fill = ring_dist(rmin_active_locked(), a2dp_write_index, A2DP_BUFFER_SIZE);
-    cold_prime_mode = false;  // we have at least one real consumer now
-  } else {
-    // Align to current shared position (no backlog catch-up)
+
+  // If A2DP is already consuming from the ring, align I²S to that reader
+  // so both outputs stay in lockstep and we don't "rewind" to cold_read_index.
+  if (a2dp_connected && a2dp_audio_ready) {
     a2dp_read_index_i2s = a2dp_read_index;
-    a2dp_buffer_fill = ring_dist(rmin_active_locked(), a2dp_write_index, A2DP_BUFFER_SIZE);
+  } else if (cold_prime_mode) {
+    // No active A2DP reader yet: start I²S from the primed beginning
+    a2dp_read_index_i2s = cold_read_index;
+    // A2DP reader will be positioned on start; this is our first real consumer
+    cold_prime_mode = false;
+  } else {
+    // No cold prime and no active A2DP: just align with the shared reader
+    a2dp_read_index_i2s = a2dp_read_index;
   }
+
+  // Recompute fill vs the minimum active reader (A2DP and/or I²S)
+  a2dp_buffer_fill = ring_dist(rmin_active_locked(), a2dp_write_index, A2DP_BUFFER_SIZE);
+
   portEXIT_CRITICAL(&a2dp_mux);
 
-  
-  //if (pcm_buffer_percent() >= 50) output_ready = true;
   return 0;
 }
 
@@ -1969,6 +1968,7 @@ int stopI2S() {
 
   return 0;
 }
+
 // Graphic EQ
 // ─────────────────────────── EQ (10-band graphic) ───────────────────────────
 static void eq_set_peak(Biquad& biq, float fs, float f0, float dBgain, float Q = 1.00f) {
@@ -2342,14 +2342,8 @@ static void bt_app_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t* p
         // Stop + flush PCM ring so the next START begins cleanly
         esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
 
-        portENTER_CRITICAL(&a2dp_mux);
-        a2dp_write_index     = 0;
-        a2dp_read_index      = 0;
-        a2dp_read_index_i2s  = 0;
-        a2dp_buffer_fill     = 0;
-        if (a2dp_buffer) memset(a2dp_buffer, 0, A2DP_BUFFER_SIZE);
-        portEXIT_CRITICAL(&a2dp_mux);
-
+        clearAudioBuffers();
+      
         onA2DPDisconnected();
 
         // Auto-reconnect (if enabled and we have a target)
@@ -2701,20 +2695,16 @@ static inline int get_next_filled_slot() {
 void decodeTask(void* /*param*/) {
 
   // ---- Hysteresis thresholds ----
-  constexpr int HI_PCT    = 70;    // pause decode when >= 90%
-  constexpr int LO_PCT    = 50;    // resume decode when <= 20%
-  constexpr int PRIME_PCT = 80;    // NET must reach 80% before decoding
+  constexpr int HI_PCT    = 85;    // pause decode when >= 75%
+  constexpr int LO_PCT    = 30;    // resume decode when <= 40%
+  constexpr int PRIME_PCT = 100;    // NET must reach 90% before decoding
 
   const size_t HI_BYTES    = (A2DP_BUFFER_SIZE * HI_PCT) / 100;
   const size_t LO_BYTES    = (A2DP_BUFFER_SIZE * LO_PCT) / 100;
   const size_t PRIME_SLOTS = (NUM_BUFFERS      * PRIME_PCT) / 100;
 
-  // ---- Period presets ----
-  constexpr TickType_t PERIOD_FAST = pdMS_TO_TICKS(2);
-  constexpr TickType_t PERIOD_NORM = pdMS_TO_TICKS(2);
-  constexpr TickType_t PERIOD_SLOW = pdMS_TO_TICKS(5);
-
-  constexpr int BUDGET_FAST = 2;
+  // ---- Decode "cadence" presets (just for work budget now) ----
+  constexpr int BUDGET_FAST = 3;
   constexpr int BUDGET_NORM = 2;
   constexpr int BUDGET_SLOW = 1;
 
@@ -2761,15 +2751,12 @@ void decodeTask(void* /*param*/) {
     return c;
   };
 
-  // ---- Scheduler ----
-  TickType_t period    = PERIOD_NORM;
-  TickType_t last_wake = xTaskGetTickCount();
-
   // ==========================================================================
   //                            MAIN LOOP
   // ==========================================================================
   for (;;) {
-    vTaskDelayUntil(&last_wake, period);
+
+    bool decoded_any = false;  // track if we actually fed any data this tick
 
     const int backlog = net_backlog();
 
@@ -2782,7 +2769,9 @@ void decodeTask(void* /*param*/) {
         decoder_paused = false;
         Serial.printf("[DEC] NET primed (%d slots)\n", backlog);
       } else {
-        continue;   // wait for NET fill
+        // Not enough NET yet; don't hammer CPU
+        vTaskDelay(pdMS_TO_TICKS(1));
+        continue;
       }
     }
 
@@ -2802,14 +2791,10 @@ void decodeTask(void* /*param*/) {
     // ============================================================
     //
     // Decode ONLY when at least one output path can consume PCM.
-    // i2s_output      -> I2S path enabled and always ready
-    // a2dp_audio_ready -> A2DP Bluetooth audio active
-    //
-    // Unified condition:
-    //       i2s_output OR a2dp_audio_ready
     //
     if (!(i2s_output || a2dp_audio_ready)) {
-      period = PERIOD_NORM;
+      // No outputs active: don't decode, just nap a bit
+      vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
 
@@ -2823,7 +2808,8 @@ void decodeTask(void* /*param*/) {
       decoder_paused = false;
 
     if (decoder_paused) {
-      period = PERIOD_NORM;
+      // Buffers are "too full" → pause decode and back off a touch
+      vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
 
@@ -2832,11 +2818,14 @@ void decodeTask(void* /*param*/) {
     // ============================================================
     int slots_budget;
     if (dA < LO_BYTES || dI < LO_BYTES || backlog >= (NUM_BUFFERS * 3 / 4)) {
-      period = PERIOD_FAST; slots_budget = BUDGET_FAST;
+      // Underrun risk or plenty of NET → decode more aggressively
+      slots_budget = BUDGET_FAST;
     } else if (dA > HI_BYTES * 9 / 10 && dI > HI_BYTES * 9 / 10) {
-      period = PERIOD_SLOW; slots_budget = BUDGET_SLOW;
+      // Very full → decode minimally
+      slots_budget = BUDGET_SLOW;
     } else {
-      period = PERIOD_NORM; slots_budget = BUDGET_NORM;
+      // Middle ground
+      slots_budget = BUDGET_NORM;
     }
 
     // ============================================================
@@ -2858,9 +2847,11 @@ void decodeTask(void* /*param*/) {
       if (sess != last_session) {
         priming = true;         // re-prime on new track
         end_codec();
-        feed_codec = CODEC_UNKNOWN;
+        feed_codec   = CODEC_UNKNOWN;
         last_session = sess;
         Serial.printf("[DEC] NEW SESSION %u\n", sess);
+        // We *did* consume a slot (session change), but no audio decoded yet.
+        // Don't hammer NET immediately; small nap at end of loop will happen.
         break;
       }
 
@@ -2880,8 +2871,13 @@ void decodeTask(void* /*param*/) {
 
       // ---- Feed codec ----
       if (bytes > 0) {
-        if (active_codec == CODEC_MP3)      mp3.write(ptr, bytes);
-        else if (active_codec == CODEC_AAC) aac.write(ptr, bytes);
+        if (active_codec == CODEC_MP3) {
+          mp3.write(ptr, bytes);
+          decoded_any = true;
+        } else if (active_codec == CODEC_AAC) {
+          aac.write(ptr, bytes);
+          decoded_any = true;
+        }
       }
 
       // ---- Release NET slot ----
@@ -2889,6 +2885,15 @@ void decodeTask(void* /*param*/) {
       netSize[slot]      = 0;
       netRead = (slot + 1) % NUM_BUFFERS;
     }
+
+    // ============================================================
+    //                 IDLE BACKOFF (ONLY IF NEEDED)
+    // ============================================================
+    if (!decoded_any) {
+      // Nothing actually fed to codec this iteration: avoid busy-wait
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    // else: no delay – we just spent CPU decoding, let the scheduler preempt us.
   }
 
   TASK_NEVER_RETURN();
@@ -2908,9 +2913,12 @@ void i2sPlaybackTask(void* /*param*/) {
   uint8_t tempBuf[CHUNK_BYTES];
 
   for (;;) {
+    bool output_any = false;  // did we actually push audio this iteration?
+
     // Fast exit if output is gated
     if (!i2s_output || !output_ready || g_pause == PAUSE_HELD) {
-      vTaskDelay(pdMS_TO_TICKS(50));
+      // Not allowed to output right now → tiny nap to avoid busy spin
+      vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
 
@@ -2924,7 +2932,7 @@ void i2sPlaybackTask(void* /*param*/) {
 
     if (avail < CHUNK_BYTES) {
       // Not enough PCM yet; short, cooperative nap
-      vTaskDelay(pdMS_TO_TICKS(2));
+      vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
 
@@ -2943,18 +2951,38 @@ void i2sPlaybackTask(void* /*param*/) {
 
     // Push exactly one DMA chunk; short timeout to stay responsive
     size_t written = 0;
-    (void)i2s_write(I2S_NUM_0, tempBuf, CHUNK_BYTES, &written, pdMS_TO_TICKS(5));
-
-    // If the driver returned early (rare), top off without blocking the system
-    while (written < CHUNK_BYTES) {
-      size_t w2 = 0;
-      (void)i2s_write(I2S_NUM_0, tempBuf + written, CHUNK_BYTES - written, &w2, pdMS_TO_TICKS(5));
-      written += w2;
-      // yield a breath if DMA is momentarily saturated
-      if (w2 == 0) vTaskDelay(pdMS_TO_TICKS(1));
+    esp_err_t res = i2s_write(I2S_NUM_0, tempBuf, CHUNK_BYTES, &written, pdMS_TO_TICKS(5));
+    if (res == ESP_OK && written > 0) {
+      output_any = true;
     }
 
+    // If the driver returned early, top off without blocking the system
+    while (written < CHUNK_BYTES) {
+      size_t w2 = 0;
+      res = i2s_write(I2S_NUM_0,
+                      tempBuf + written,
+                      CHUNK_BYTES - written,
+                      &w2,
+                      pdMS_TO_TICKS(5));
+      written += w2;
 
+      if (res == ESP_OK && w2 > 0) {
+        output_any = true;
+      }
+
+      // DMA saturated / nothing more written → brief backoff
+      if (w2 == 0) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        break;
+      }
+    }
+
+    // Only back off if we didn’t really output anything this loop
+    if (!output_any) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    // else: no explicit delay — time spent in i2s_write is enough,
+    // scheduler can preempt us as needed.
   }
 
   TASK_NEVER_RETURN();
@@ -3120,10 +3148,10 @@ void setup() {
   } 
 
 
-  xTaskCreatePinnedToCore(httpFillTask, "HTTPFill", 8096, NULL, 1 , &httpTaskHandle, 1);
+  xTaskCreatePinnedToCore(httpFillTask, "HTTPFill", 8096, NULL, 3 , &httpTaskHandle, 1);
   xTaskCreatePinnedToCore(decodeTask, "MP3Decoder", 8096, NULL, 2, &decodeTaskHandle, 1);
 
-  xTaskCreatePinnedToCore(i2sPlaybackTask, "I2SPlay", 4096, NULL, 3, &i2sTaskHandle, 1);
+  xTaskCreatePinnedToCore(i2sPlaybackTask, "I2SPlay", 4096, NULL, 4, &i2sTaskHandle, 1);
   vTaskSuspend(i2sTaskHandle);
 
   Serial.println("✅ Init OK\n▶️ Decoder Ready");
