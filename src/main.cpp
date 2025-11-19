@@ -17,6 +17,7 @@
 // Recommend PCM5102 DAC (I2S with Stereo RCA and headphone/lineout jack outputs)
 // https://www.aliexpress.com/item/1005005352684938.html?spm=a2g0o.order_list.order_list_main.136.73d21802kujr90
 
+#include <Arduino.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>  // add near other C headers
@@ -121,6 +122,7 @@ using namespace libhelix;
 #endif
 //LVGL
 
+TaskHandle_t btWorkerHandle = nullptr;
 TaskHandle_t httpTaskHandle = nullptr;
 TaskHandle_t decodeTaskHandle = NULL;
 TaskHandle_t i2sTaskHandle = NULL;
@@ -425,7 +427,11 @@ static inline int net_filled_slots();
 
 void lvglUpdateTask(void* /*param*/);
 
-bool player_next();
+bool player_next();   // already exists
+bool player_prev();
+bool player_start();
+bool player_stop();
+
 
 void clearAudioBuffers();
 
@@ -436,6 +442,8 @@ static void onA2DPAudioState(esp_a2d_audio_state_t state, void*);
 static BtConnectionStatus connect_direct_mac(const uint8_t* mac);
 int startI2S();
 int stopI2S();
+
+void decodeTask(void* /*param*/);
 
 MP3DecoderHelix mp3;
 AACDecoderHelix aac;
@@ -550,7 +558,7 @@ void lvgl_start_task() {
         ui_update_stats_decoder(codec_name_from_enum(feed_codec), currentMP3Info.samplerate, currentMP3Info.channels, currentMP3Info.kbps);
         ui_update_stats_outputs(i2s_output, a2dp_connected, a2dp_connected_name);
         ui_update_stats_wifi(WiFi.status(), WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-        //ui_update_player_id3(g_ui, true, id3m.artist, id3m.title, id3m.album, (int)id3m.track);
+       
 
         lv_timer_handler();
 
@@ -735,6 +743,12 @@ static inline void request_run() {
 static inline void request_pause_held() {
   g_pause = PAUSE_HELD;
   decoder_paused = true;
+}
+
+// Hard-pause decoder immediately
+static inline void request_pause_release() {
+  g_pause = PAUSE_RUNNING;
+  decoder_paused = false;
 }
 
 static const char* current_url() {
@@ -1144,19 +1158,82 @@ static void httpFillTask(void* arg)
 }
 
 bool player_start() {
-
-  if (a2dp_audio_ready || i2s_output) {
-    
+  // Need at least one output path enabled
+  if (!(a2dp_audio_ready || i2s_output)) {
+    Serial.println("[PLAYER] ▶ Start requested but no outputs enabled (A2DP/I2S off)");
+    return false;
   }
-  request_pause_held();
-  stream_running = false;
-  Serial.println("[PLAYER] ⏹ Stop");
+
+  // Allow decoder to run
+  request_pause_release();
+  stream_running = true;
+
+  // --------------------------
+  // Decode task
+  // --------------------------
+  if (decodeTaskHandle == nullptr) {
+    // First time: create the task
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        decodeTask,
+        "MP3Decoder",
+        8096,
+        nullptr,
+        2,                  // priority
+        &decodeTaskHandle,
+        1                   // core 1 (same as before)
+    );
+    if (ok != pdPASS) {
+      Serial.println("[PLAYER] ❌ Failed to create decodeTask");
+      decodeTaskHandle = nullptr;
+      return false;
+    }
+  } else {
+    // Subsequent starts: resume if it was suspended
+    vTaskResume(decodeTaskHandle);
+  }
+
+  // --------------------------
+  // HTTP fill task
+  // --------------------------
+  if (httpTaskHandle == nullptr) {
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        httpFillTask,
+        "HTTPFill",
+        8096,
+        nullptr,
+        1,                  // priority
+        &httpTaskHandle,
+        1                   // core 1
+    );
+    if (ok != pdPASS) {
+      Serial.println("[PLAYER] ❌ Failed to create httpFillTask");
+      httpTaskHandle = nullptr;
+      // Optionally suspend/stop decodeTask here if you want all-or-nothing
+      return false;
+    }
+  } else {
+    vTaskResume(httpTaskHandle);
+  }
+
+  Serial.println("[PLAYER] ▶ Start");
   return true;
 }
 
 bool player_stop() {
+  // Tell decode path we are paused / draining
   request_pause_held();
   stream_running = false;
+
+  // We don't delete tasks anymore; we just suspend them.
+  // vTaskSuspend() is safe to call even if the task is already suspended.
+  if (decodeTaskHandle != nullptr) {
+    vTaskSuspend(decodeTaskHandle);
+  }
+
+  if (httpTaskHandle != nullptr) {
+    vTaskSuspend(httpTaskHandle);
+  }
+
   Serial.println("[PLAYER] ⏹ Stop");
   return true;
 }
@@ -1189,7 +1266,7 @@ bool player_next() {
   return true;
 }
 
-bool player_previous() {
+bool player_prev() {
   if (playlist_count <= 0) return false;
 
   net_ring_clear();
@@ -2311,7 +2388,11 @@ int32_t pcm_data_callback(uint8_t* data, int32_t len) {
   return (int32_t)to_copy;
 }
 
-static void bt_app_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t* param) {
+volatile bool g_pending_a2dp_flush = false;
+volatile bool g_pending_autorc     = false;
+
+static void bt_app_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t* param)
+{
   switch (event) {
 
     // ------------------------------------------------------------
@@ -2320,11 +2401,11 @@ static void bt_app_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t* p
     case ESP_A2D_CONNECTION_STATE_EVT: {
       esp_a2d_connection_state_t s = param->conn_stat.state;
 
-      // Keep your UI/flags dispatcher
+      // Centralised state dispatcher (UI, flags, etc.)
       onA2DPConnectState(s, nullptr);
 
       if (s == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-        // Update our connected state + friendly name (MAC immediately; async GAP name if enabled)
+        // Update our connected state + friendly name
         onA2DPConnected(param->conn_stat.remote_bda);
 
         // Remember peer for future auto-reconnect
@@ -2339,20 +2420,17 @@ static void bt_app_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t* p
         }
       }
       else if (s == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
-        // Stop + flush PCM ring so the next START begins cleanly
-        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
+        // Keep callback *light*: just set flags.
+        // The BT worker task will:
+        //  - esp_a2d_media_ctrl(STOP)
+        //  - flush the PCM ring
+        //  - call onA2DPDisconnected()
+        //  - schedule auto-reconnect if desired
+        g_pending_a2dp_flush = true;
 
-        clearAudioBuffers();
-      
-        onA2DPDisconnected();
-
-        // Auto-reconnect (if enabled and we have a target)
         if (g_auto_reconnect_enabled && g_have_last_bda) {
-          stopAllDiscovery();  // scanning interferes with reconnect
-          Serial.println("🔁 AutoRC: scheduling reconnect…");
-          g_next_reconnect_ms = millis() + AUTORC_MIN_COOLDOWN_MS;
-          a2dp_start_autorc_task();
-          // UI remains in CONNECTING via onA2DPConnectState()
+          stopAllDiscovery();      // safe even if nothing is running
+          g_pending_autorc = true; // worker will call a2dp_start_autorc_task()
         }
       }
       else if (s == ESP_A2D_CONNECTION_STATE_CONNECTING) {
@@ -2377,17 +2455,20 @@ static void bt_app_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t* p
     // ------------------------------------------------------------
     case ESP_A2D_AUDIO_CFG_EVT: {
       if (param->audio_cfg.mcc.type == ESP_A2D_MCT_SBC) {
-        // sbc[0] bits 7..4 = sample rate flags; bit1 often indicates mono
         const uint8_t oct0 = param->audio_cfg.mcc.cie.sbc[0];
 
         int sr = 44100;
-        if      (oct0 & (1 << 4)) sr = 48000;   // 48 kHz
-        else if (oct0 & (1 << 5)) sr = 44100;   // 44.1 kHz
-        else if (oct0 & (1 << 6)) sr = 32000;   // 32 kHz
-        else if (oct0 & (1 << 7)) sr = 16000;   // 16 kHz (rare)
+        if      (oct0 & 0x80) sr = 16000;
+        else if (oct0 & 0x40) sr = 32000;
+        else if (oct0 & 0x20) sr = 44100;
+        else if (oct0 & 0x10) sr = 48000;
 
-        i2s_set_sample_rates(I2S_NUM_0, sr);
-        Serial.printf("A2DP SRC: audio cfg → sr=%d Hz\r\n", sr);
+        const bool mono = (oct0 & 0x02) != 0;
+
+        Serial.printf("A2DP SBC cfg: %d Hz, %s\n", sr, mono ? "mono" : "stereo");
+
+        // You can adjust your internal sample-rate / I2S config here if needed.
+        // For now we assume 44.1k/48k stereo is fine as-is.
       }
       break;
     }
@@ -2409,11 +2490,14 @@ static void bt_app_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t* p
         } else {
           Serial.printf("A2DP SRC: CHECK_SRC_RDY not ready (ack=%d)\n", (int)st);
         }
-      } else if (cmd == ESP_A2D_MEDIA_CTRL_START) {
+      }
+      else if (cmd == ESP_A2D_MEDIA_CTRL_START) {
         Serial.printf("A2DP SRC: START ack=%d\r\n", (int)st);
-      } else if (cmd == ESP_A2D_MEDIA_CTRL_STOP) {
+      }
+      else if (cmd == ESP_A2D_MEDIA_CTRL_STOP) {
         Serial.printf("A2DP SRC: STOP ack=%d\r\n", (int)st);
-      } else {
+      }
+      else {
         Serial.printf("A2DP SRC: media ctrl cmd=%d ack=%d\r\n", (int)cmd, (int)st);
       }
       break;
@@ -2426,6 +2510,34 @@ static void bt_app_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t* p
   }
 }
 
+
+void bt_worker_task(void* arg) {
+  for (;;) {
+    if (g_pending_a2dp_flush) {
+      g_pending_a2dp_flush = false;
+      esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
+
+      portENTER_CRITICAL(&a2dp_mux);
+      a2dp_write_index     = 0;
+      a2dp_read_index      = 0;
+      a2dp_read_index_i2s  = 0;
+      a2dp_buffer_fill     = 0;
+      if (a2dp_buffer) memset(a2dp_buffer, 0, A2DP_BUFFER_SIZE);
+      portEXIT_CRITICAL(&a2dp_mux);
+
+      onA2DPDisconnected();
+    }
+
+    if (g_pending_autorc) {
+      g_pending_autorc = false;
+      Serial.println("🔁 AutoRC: scheduling reconnect…");
+      g_next_reconnect_ms = millis() + AUTORC_MIN_COOLDOWN_MS;
+      a2dp_start_autorc_task();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
 
 static inline bool any_output_enabled() {
   return i2s_output || a2dp_audio_ready;
@@ -2504,7 +2616,7 @@ void onA2DPConnectState(esp_a2d_connection_state_t state, void*) {
         a2dp_connected = false;
         g_connect_inflight = true;
         ui_state = UI_CONNECTING;
-        Serial.println("A2DP Connecting…");
+        //Serial.println("A2DP Connecting…");
         break;
       }
 
@@ -2512,7 +2624,7 @@ void onA2DPConnectState(esp_a2d_connection_state_t state, void*) {
       {
         a2dp_connected = false;
         g_connect_inflight = false;
-        Serial.println("A2DP Disconnecting…");
+        //Serial.println("A2DP Disconnecting…");
         break;
       }
 
@@ -2544,9 +2656,7 @@ void onA2DPAudioState(esp_a2d_audio_state_t state, void*) {
         }
         portEXIT_CRITICAL(&a2dp_mux);
 
-        //if (pcm_buffer_percent() >= 75) output_ready = true;
-
-        Serial.println("🔊 A2DP Sink Ready — Audio streaming started!");
+        Serial.println("🔊 A2DP Sink Ready for Audio");
         break;
       }
 
@@ -2640,7 +2750,7 @@ void avrc_target_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t* 
             case ESP_AVRC_PT_CMD_BACKWARD:
               button_name = "PREV";
               Serial.printf("\r\n[AVRCP] Prev Track\r\n");
-              player_previous();
+              player_prev();
               break;
             case ESP_AVRC_PT_CMD_FAST_FORWARD: button_name = "FF"; break;
             case ESP_AVRC_PT_CMD_REWIND: button_name = "RW"; break;
@@ -2850,6 +2960,13 @@ void decodeTask(void* /*param*/) {
         feed_codec   = CODEC_UNKNOWN;
         last_session = sess;
         Serial.printf("[DEC] NEW SESSION %u\n", sess);
+
+        // Update UI with ID3 Info
+        if (id3m.header_found)
+          ui_update_player_id3(true, id3m.artist, id3m.title, id3m.album, (int)id3m.track);
+        else
+          ui_update_player_id3(false, "-", "-", "-", -1);
+
         // We *did* consume a slot (session change), but no audio decoded yet.
         // Don't hammer NET immediately; small nap at end of loop will happen.
         break;
@@ -3147,10 +3264,7 @@ void setup() {
     if (!a2dp_connected) a2dp_start_autorc_task();
   } 
 
-
-  xTaskCreatePinnedToCore(httpFillTask, "HTTPFill", 8096, NULL, 3 , &httpTaskHandle, 1);
-  xTaskCreatePinnedToCore(decodeTask, "MP3Decoder", 8096, NULL, 2, &decodeTaskHandle, 1);
-
+  xTaskCreatePinnedToCore(bt_worker_task,"BTWorker", 4096, nullptr, 3, &btWorkerHandle, 0);       // run on core 0 with the BT controller
   xTaskCreatePinnedToCore(i2sPlaybackTask, "I2SPlay", 4096, NULL, 4, &i2sTaskHandle, 1);
   vTaskSuspend(i2sTaskHandle);
 

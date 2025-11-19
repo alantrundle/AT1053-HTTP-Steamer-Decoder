@@ -181,6 +181,86 @@ void ui_update_stats_wifi(bool connected,
     }
 }
 
+void ui_update_player_id3(bool has_meta,
+                          const char* artist,
+                          const char* title,
+                          const char* album,
+                          int track)
+{
+    // Cache last values so we only update LVGL when they actually change
+    static bool  last_have_meta = false;
+    static char  last_artist[64] = "";
+    static char  last_title[64]  = "";
+    static char  last_album[64]  = "";
+    static int   last_track      = -1;
+
+    char buf[64];
+
+    // If no metadata: show placeholder (once)
+    if (!has_meta) {
+        if (last_have_meta) {
+            last_have_meta = false;
+
+            if (objects.player_lbl_artist) lv_label_set_text(objects.player_lbl_artist, "—");
+            if (objects.player_lbl_title)  lv_label_set_text(objects.player_lbl_title,  "—");
+            if (objects.player_lbl_album)  lv_label_set_text(objects.player_lbl_album,  "—");
+            if (objects.player_lbl_tracknumber) lv_label_set_text(objects.player_lbl_tracknumber, "—");
+        }
+        return;
+    }
+
+    last_have_meta = true;
+
+    /* ---------------- ARTIST ---------------- */
+    const char* artist_safe = (artist && *artist) ? artist : "Unknown Artist";
+    if (strcmp(artist_safe, last_artist) != 0) {
+        strncpy(last_artist, artist_safe, sizeof(last_artist));
+        last_artist[sizeof(last_artist) - 1] = '\0';
+
+        if (objects.player_lbl_artist) {
+            lv_label_set_text(objects.player_lbl_artist, last_artist);
+        }
+    }
+
+    /* ---------------- TITLE ---------------- */
+    const char* title_safe = (title && *title) ? title : "Unknown Title";
+    if (strcmp(title_safe, last_title) != 0) {
+        strncpy(last_title, title_safe, sizeof(last_title));
+        last_title[sizeof(last_title) - 1] = '\0';
+
+        if (objects.player_lbl_title) {
+            lv_label_set_text(objects.player_lbl_title, last_title);
+        }
+    }
+
+    /* ---------------- ALBUM ---------------- */
+    const char* album_safe = (album && *album) ? album : "Unknown Album";
+    if (strcmp(album_safe, last_album) != 0) {
+        strncpy(last_album, album_safe, sizeof(last_album));
+        last_album[sizeof(last_album) - 1] = '\0';
+
+        if (objects.player_lbl_album) {
+            lv_label_set_text(objects.player_lbl_album, last_album);
+        }
+    }
+
+    /* ---------------- TRACK NUMBER ---------------- */
+    if (track != last_track) {
+        last_track = track;
+
+        if (objects.player_lbl_tracknumber) {
+            if (track > 0) {
+                snprintf(buf, sizeof(buf), "%d", track);
+            } else {
+                snprintf(buf, sizeof(buf), "—");
+            }
+            lv_label_set_text(objects.player_lbl_tracknumber, buf);
+        }
+    }
+}
+
+
+
 
 
 
