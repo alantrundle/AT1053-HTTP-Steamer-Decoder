@@ -226,6 +226,7 @@ esp_bd_addr_t a2dp_connected_bda;
 
 volatile bool a2dp_audio_ready = false;
 volatile bool decoder_paused = false;
+bool g_id3_session_pending = false;
 volatile bool output_ready = false;
 
 volatile bool i2s_output = false;  // set to enable i2s by default
@@ -558,6 +559,12 @@ void lvgl_start_task() {
         ui_update_stats_decoder(codec_name_from_enum(feed_codec), currentMP3Info.samplerate, currentMP3Info.channels, currentMP3Info.kbps);
         ui_update_stats_outputs(i2s_output, a2dp_connected, a2dp_connected_name);
         ui_update_stats_wifi(WiFi.status(), WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+
+        // Update UI with ID3 Info
+        if (id3m.header_found && g_id3_session_pending)
+          ui_update_player_id3(true, id3m.artist, id3m.title, id3m.album, (int)id3m.track);
+        else
+          ui_update_player_id3(false, "-", "-", "-", -1);
        
 
         lv_timer_handler();
@@ -1968,8 +1975,8 @@ void setupI2S() {
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = 0,
-    .dma_buf_count = 8,  // keep modest to save IRAM
-    .dma_buf_len = 128,
+    .dma_buf_count = 12,  // keep modest to save IRAM
+    .dma_buf_len = 256,
     .use_apll = false,
     .tx_desc_auto_clear = true
   };
@@ -2266,7 +2273,6 @@ void aacDataCallback(AACFrameInfo& info, int16_t* pcm, size_t len, void*) {
   ring_write_pcm_shared(reinterpret_cast<uint8_t*>(pcm), pcm_bytes);
 }
 
-// --- MP3 -> PCM callback (shared ring writer; no I2S buffer)
 // --- MP3 -> PCM callback (shared ring writer; no I2S buffer)
 void mp3dataCallback(MP3FrameInfo& info, int16_t* pcm, size_t len, void*) {
   if (!pcm || len == 0) return;
@@ -2961,11 +2967,7 @@ void decodeTask(void* /*param*/) {
         last_session = sess;
         Serial.printf("[DEC] NEW SESSION %u\n", sess);
 
-        // Update UI with ID3 Info
-        if (id3m.header_found)
-          ui_update_player_id3(true, id3m.artist, id3m.title, id3m.album, (int)id3m.track);
-        else
-          ui_update_player_id3(false, "-", "-", "-", -1);
+        g_id3_session_pending = true;
 
         // We *did* consume a slot (session change), but no audio decoded yet.
         // Don't hammer NET immediately; small nap at end of loop will happen.
@@ -3022,7 +3024,7 @@ void decodeTask(void* /*param*/) {
 // Efficient 16-bit stereo I²S playback (4 bytes/frame), tuned to dma_buf_len=256
 void i2sPlaybackTask(void* /*param*/) {
   // Match your I²S DMA frame length (keep this = i2s_config.dma_buf_len)
-  constexpr size_t FRAMES_PER_CHUNK = 128;
+  constexpr size_t FRAMES_PER_CHUNK = 256;
   constexpr size_t BYTES_PER_FRAME  = 4;                  // L16 + R16
   constexpr size_t CHUNK_BYTES      = FRAMES_PER_CHUNK * BYTES_PER_FRAME;
 

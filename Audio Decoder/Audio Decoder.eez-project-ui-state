@@ -1,8 +1,11 @@
 {
   "navigation": {
     "selectedUserPageObject": "[Audio Decoder.eez-project]:/userPages/2",
-    "selectedActionObject": "[Audio Decoder.eez-project]:/actions/6",
-    "subnavigationSelectedItems": {}
+    "selectedActionObject": "[Audio Decoder.eez-project]:/actions/5",
+    "selectedGlobalVariableObject": "[Audio Decoder.eez-project]:/variables/globalVariables/0",
+    "subnavigationSelectedItems": {
+      "variables-tab/sub-navigation/selected-item": "Global"
+    }
   },
   "layoutModel": {
     "rootEditor": {
@@ -122,6 +125,7 @@
                   "type": "tabset",
                   "id": "#c564ef36-b272-413b-bdd1-b5634bcb6cbe",
                   "weight": 1,
+                  "selected": 2,
                   "enableClose": false,
                   "children": [
                     {
@@ -1046,10 +1050,12 @@
       "selection": {
         "0": {
           "1": {},
+          "2": {
+            "$selected": true
+          },
           "3": {},
           "4": {},
-          "5": {},
-          "6": {}
+          "5": {}
         }
       },
       "transform": {
@@ -1085,7 +1091,8 @@
     "POSITION AND SIZE",
     "LAYOUT",
     "BORDER",
-    "TEXT"
+    "TEXT",
+    "BACKGROUND"
   ],
   "showInactiveFlowsInDebugger": true,
   "globalFlowZoom": true,

@@ -32,7 +32,8 @@ typedef struct _objects_t {
     lv_obj_t *stats_lbl_wifi_ipaddress;
     lv_obj_t *stats_lbl_wifi_on;
     lv_obj_t *obj2;
-    lv_obj_t *obj3;
+    lv_obj_t *player_img_albumart;
+    lv_obj_t *player_lbl_btn_play_pause;
     lv_obj_t *player_lbl_title;
     lv_obj_t *player_lbl_artist;
     lv_obj_t *player_lbl_album;

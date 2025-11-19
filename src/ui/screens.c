@@ -490,6 +490,7 @@ void create_screen_player() {
     objects.player = obj;
     lv_obj_set_pos(obj, 0, 0);
     lv_obj_set_size(obj, 480, 320);
+    lv_obj_set_style_bg_color(obj, lv_color_hex(0xfff27c7c), LV_PART_MAIN | LV_STATE_DEFAULT);
     {
         lv_obj_t *parent_obj = obj;
         {
@@ -522,23 +523,28 @@ void create_screen_player() {
             }
         }
         {
+            // playerImgAlbumart
             lv_obj_t *obj = lv_image_create(parent_obj);
-            objects.obj3 = obj;
+            objects.player_img_albumart = obj;
             lv_obj_set_pos(obj, 21, 48);
             lv_obj_set_size(obj, 100, 100);
             lv_obj_set_style_border_color(obj, lv_color_hex(0xff000000), LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_border_width(obj, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_border_opa(obj, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(obj, lv_color_hex(0xffffffff), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_opa(obj, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
         }
         {
             lv_obj_t *obj = lv_button_create(parent_obj);
-            lv_obj_set_pos(obj, 11, 190);
-            lv_obj_set_size(obj, 100, 50);
-            lv_obj_add_event_cb(obj, action_player_play, LV_EVENT_PRESSED, (void *)0);
+            lv_obj_set_pos(obj, 202, 198);
+            lv_obj_set_size(obj, 77, 50);
+            lv_obj_add_event_cb(obj, action_player_play_pause, LV_EVENT_PRESSED, (void *)0);
             {
                 lv_obj_t *parent_obj = obj;
                 {
+                    // playerLblBtnPlayPause
                     lv_obj_t *obj = lv_label_create(parent_obj);
+                    objects.player_lbl_btn_play_pause = obj;
                     lv_obj_set_pos(obj, 0, 0);
                     lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
                     lv_obj_set_style_align(obj, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -548,24 +554,8 @@ void create_screen_player() {
         }
         {
             lv_obj_t *obj = lv_button_create(parent_obj);
-            lv_obj_set_pos(obj, 132, 190);
-            lv_obj_set_size(obj, 100, 50);
-            lv_obj_add_event_cb(obj, action_player_stop, LV_EVENT_PRESSED, (void *)0);
-            {
-                lv_obj_t *parent_obj = obj;
-                {
-                    lv_obj_t *obj = lv_label_create(parent_obj);
-                    lv_obj_set_pos(obj, 0, 0);
-                    lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-                    lv_obj_set_style_align(obj, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
-                    lv_label_set_text(obj, "Stop");
-                }
-            }
-        }
-        {
-            lv_obj_t *obj = lv_button_create(parent_obj);
-            lv_obj_set_pos(obj, 248, 190);
-            lv_obj_set_size(obj, 100, 50);
+            lv_obj_set_pos(obj, 95, 198);
+            lv_obj_set_size(obj, 77, 50);
             lv_obj_add_event_cb(obj, action_player_previous, LV_EVENT_PRESSED, (void *)0);
             {
                 lv_obj_t *parent_obj = obj;
@@ -580,8 +570,8 @@ void create_screen_player() {
         }
         {
             lv_obj_t *obj = lv_button_create(parent_obj);
-            lv_obj_set_pos(obj, 362, 190);
-            lv_obj_set_size(obj, 100, 50);
+            lv_obj_set_pos(obj, 310, 198);
+            lv_obj_set_size(obj, 77, 50);
             lv_obj_add_event_cb(obj, action_player_next, LV_EVENT_PRESSED, (void *)0);
             {
                 lv_obj_t *parent_obj = obj;
@@ -599,7 +589,7 @@ void create_screen_player() {
             lv_obj_t *obj = lv_label_create(parent_obj);
             objects.player_lbl_title = obj;
             lv_obj_set_pos(obj, 152, 48);
-            lv_obj_set_size(obj, 128, LV_SIZE_CONTENT);
+            lv_obj_set_size(obj, 317, LV_SIZE_CONTENT);
             lv_label_set_text(obj, "Now playing...");
         }
         {
@@ -607,7 +597,7 @@ void create_screen_player() {
             lv_obj_t *obj = lv_label_create(parent_obj);
             objects.player_lbl_artist = obj;
             lv_obj_set_pos(obj, 153, 65);
-            lv_obj_set_size(obj, 128, LV_SIZE_CONTENT);
+            lv_obj_set_size(obj, 316, LV_SIZE_CONTENT);
             lv_obj_set_style_text_font(obj, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_label_set_text(obj, "-");
         }
@@ -616,7 +606,7 @@ void create_screen_player() {
             lv_obj_t *obj = lv_label_create(parent_obj);
             objects.player_lbl_album = obj;
             lv_obj_set_pos(obj, 153, 83);
-            lv_obj_set_size(obj, 128, LV_SIZE_CONTENT);
+            lv_obj_set_size(obj, 316, LV_SIZE_CONTENT);
             lv_obj_set_style_text_font(obj, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_label_set_text(obj, "-");
         }
@@ -625,7 +615,7 @@ void create_screen_player() {
             lv_obj_t *obj = lv_label_create(parent_obj);
             objects.player_lbl_tracknumber = obj;
             lv_obj_set_pos(obj, 153, 98);
-            lv_obj_set_size(obj, 128, LV_SIZE_CONTENT);
+            lv_obj_set_size(obj, 316, LV_SIZE_CONTENT);
             lv_obj_set_style_text_font(obj, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_label_set_text(obj, "-");
         }

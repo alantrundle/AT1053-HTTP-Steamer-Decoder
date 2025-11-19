@@ -6,6 +6,9 @@ extern bool player_prev();
 extern bool player_start();
 extern bool player_stop();
 
+bool isPaused = false;
+
+
 // -----------------------------------------------------------------------------
 // Helper: switch to START screen
 // -----------------------------------------------------------------------------
@@ -49,13 +52,23 @@ void action_goto_player_view(lv_event_t * e) {
     goto_player_view();
 }
 
-void action_player_play(lv_event_t * e) {
-    player_start();
+void action_player_play_pause(lv_event_t * e) {
+
+    if(isPaused) {
+        player_stop();
+        lv_label_set_text(objects.player_lbl_btn_play_pause, "Play");
+        isPaused = false;
+    } else {
+        player_start();
+        lv_label_set_text(objects.player_lbl_btn_play_pause, "Pause");
+        isPaused = true;
+    }
+
 }
 
-void action_player_stop(lv_event_t * e) {
-    player_stop();
-}
+
+
+
 
 void action_player_previous(lv_event_t * e) {
     player_prev();
