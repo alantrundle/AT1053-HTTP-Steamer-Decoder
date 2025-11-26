@@ -1973,7 +1973,7 @@ void setupI2S() {
     .sample_rate = 44100,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .communication_format = I2S_COMM_FORMAT_I2S,
     .intr_alloc_flags = 0,
     .dma_buf_count = 12,  // keep modest to save IRAM
     .dma_buf_len = 256,
